@@ -334,6 +334,7 @@ class Recommender(nn.Module):
         return loss
 
 
+# 使用DGL实现的AIAConv，略有改写，思路一致
 class DGLAIAConv(nn.Module):
     def __init__(self, in_feats, out_feats, num_heads,
                  num_marks, feat_drop=0., att_drop=0., residual=True):
@@ -341,15 +342,15 @@ class DGLAIAConv(nn.Module):
         self.num_units = out_feats
         self.num_heads = num_heads
         self.num_marks = num_marks
-        self.residual = residual
+        self.residual = residual ## 残差连接？
 
         # Query, Key, Value, Timespan transformation
         self.fc_q = nn.Linear(in_feats, out_feats, bias=False)
         self.fc_k = nn.Linear(in_feats, out_feats, bias=False)
         self.fc_v = nn.Linear(in_feats, out_feats, bias=False)
         self.fc_t = nn.Linear(in_feats, out_feats, bias=False)
-        self.fc_e = nn.Linear(1, out_feats, bias=False)
-        self.feat_drop = nn.Dropout(feat_drop)
+        self.fc_e = nn.Linear(1, out_feats, bias=False) ## 事件特征转换？
+        self.feat_drop = nn.Dropout(feat_drop) ## 特征dropout？
         self.att_drop = nn.Dropout(att_drop)
 
         # Event transformation
@@ -370,6 +371,8 @@ class DGLAIAConv(nn.Module):
         nn.init.kaiming_uniform_(self.weight_i, a=math.sqrt(5))
         nn.init.zeros_(self.scale_i)
 
+    # 消息函数
+    # 节点特征相乘（计算边特征），再计算边权重（普通方法 or attention）
     @staticmethod
     def msg_fn_prod(edges):
         el = edges.src['fk']
@@ -407,7 +410,7 @@ class DGLAIAConv(nn.Module):
         # => num_nodes, num_heads * batch_size, head_units * num_marks
         mark_units = th.sigmoid(mark_units)
         # => 1, num_nodes * num_heads * batch_size, head_units
-        mark_units = th.cat(mark_units.chunk(num_nodes, dim=0), dim=1)
+        mark_units = th.cat(mark_units.chunk(num_nodes, dim=0), dim=1) ##
         # => num_marks, num_nodes * num_heads * batch_size, head_units
         mark_units = th.cat(mark_units.chunk(self.num_marks, dim=2), dim=0)
         # => num_nodes * num_heads * batch_size, num_marks, head_units
