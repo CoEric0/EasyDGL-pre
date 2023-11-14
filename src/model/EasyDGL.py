@@ -170,6 +170,8 @@ class AIAConv(nn.Module):
         outs = outs * mark_inty  # (h*N, T_q, T_k)
         outs = th.matmul(self.att_drop(outs), V_)
 
+
+        # --------------------------------------------------------
         # Residual connection
         outs = th.cat(outs.chunk(self.num_heads, dim=0), dim=2)  # (N, T_q, C)
         outs += queries[..., :self.num_units] # 输出特征向量维度
@@ -490,6 +492,8 @@ class DGLAIAConv(nn.Module):
             # outs: num_nodes, batch_size, num_units
             outs = th.cat(th.chunk(outs, self.num_heads, dim=1), dim=2)
 
+            # 在普通版中默认开启
+            # 残差：解决梯度消失和梯度爆炸问题
             if self.residual:
                 outs += h_dst
             return outs
