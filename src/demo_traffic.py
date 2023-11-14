@@ -94,7 +94,7 @@ def run():
 
     xtrain_mean = th.from_numpy(reader.train_data['mean']).float().to(device)
     xtrain_std = th.from_numpy(reader.train_data['std']).float().to(device)
-    scaler = StandardScaler(xtrain_mean, xtrain_std)
+    scaler = StandardScaler(xtrain_mean, xtrain_std) # （训练）scaler，均值和标准差
 
     batch_size = data_config.get('batch_size')
     mask_rate = data_config.get('mask_rate')
@@ -140,16 +140,18 @@ def run():
         # training stage
         net.train()
         for feat, label in train_dataloader:
+            # 将feat字典中的所有值都发送到device设备上，并且返回一个新字典
             feat = {k: v.to(device) for k, v in feat.items()}
             y_true = label[..., 0].to(device)
             if th.sum(y_true).item() == 0.:
-                continue
+                # 和为0，没有训练价值，跳过
+                continue 
 
-            feat['x'] = scaler.transform(feat['x'])
+            feat['x'] = scaler.transform(feat['x']) # 数据标准化
 
             # Forward-inference
             y_pred = net.forward(graph, feat)
-            y_pred = scaler.inverse_transform(y_pred)
+            y_pred = scaler.inverse_transform(y_pred) # 数据反标准化，恢复到原始的尺度和量纲
 
             loss = net.loss(y_pred, y_true)
             running_loss.append(loss.item())
@@ -157,8 +159,8 @@ def run():
             # Back-propogation
             optim.zero_grad(set_to_none=True)
             loss.backward()
-            nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
-            optim.step()
+            nn.utils.clip_grad_norm_(net.parameters(), grad_clip) # 梯度裁剪，防止梯度爆炸
+            optim.step() # 更新参数
 
         scheduler.step()  # update the learning rate
         logging.info("{0:3d}, loss={1:5f}, lr={2:5f}".format(

@@ -14,7 +14,7 @@ from sklearn.cluster import SpectralClustering
 from torch.utils.data import Dataset
 from torch.utils.data.dataset import T_co
 
-
+# 应用mask，连接张量
 def collate_mask(list_tensors, mask_fn):
     xs = [i[0] for i in list_tensors]
     ts = [i[1] for i in list_tensors]
@@ -32,7 +32,7 @@ def collate_mask(list_tensors, mask_fn):
     decoded_tensors = {'x': xs, 't': ts, 'p': ps}
     return decoded_tensors, labels
 
-
+# 连接张量，无mask
 def collate_fn(list_tensors):
     xs = [i[0] for i in list_tensors]
     ts = [i[1] for i in list_tensors]
@@ -64,12 +64,19 @@ class METRDataset(Dataset):
         y = self.y[index:index + 1]
         return x, t, y
 
-
+# 读入数据的类
 class Reader(object):
+
+
+    #
+    # 必须准备好train，valid，test数据集，邻接矩阵
+    # congest可有可无，没有会主动生成
+    #
+
     def __init__(self, fpath: str):
-        fout_train: str = os.path.join(fpath, "train.npz")
-        fout_valid: str = os.path.join(fpath, "valid.npz")
-        fout_test: str = os.path.join(fpath, "test.npz")
+        fout_train: str = os.path.join(fpath, "train.npz") # 70%
+        fout_valid: str = os.path.join(fpath, "valid.npz") # 10%
+        fout_test: str = os.path.join(fpath, "test.npz") # 20%
         fout_adj: str = os.path.join(fpath, "adj_mx.pkl")
         fout_congest: str = os.path.join(fpath, "congest.npz")
 
@@ -93,6 +100,8 @@ class Reader(object):
             logging.info(f"load congestion file: {fout_congest}")
             self.load(fout_congest)
 
+
+    # 只给本类用的函数，计算拥塞的相关信息
     def build(self, k=5):
         # for example, in test.npz, the shape is (6850, 12, 207)
         all_train_data = self.train_data['x'][::12]
@@ -106,15 +115,19 @@ class Reader(object):
             # => (6850, 12, 207)
             xtrain_mean, xtrain_std = mean[:, 0], std[:, 0]
             input_data = input_data[:, :, :, 0]
-            mask_events = np.logical_and(input_data < (xtrain_mean - xtrain_std), input_data != 0.)
-            mask_events = mask_events.astype(np.float)[:, ::-1]
+            # 建立掩码，用于标记交通拥堵事件
+            mask_events = np.logical_and(input_data < (xtrain_mean - xtrain_std), input_data != 0.)  # data中流量数据足够小
+            mask_events = mask_events.astype(np.float)[:, ::-1] # 逆序
 
             # for example,
             #   input: [0, 1, 1, 0, 0, ...]
-            #   -> [..., 0, 0, 1, 1, 0]
-            #   -> [..., 0, 0, 1, 2, 2]
-            #   -> [..., 0, 0, 1, 1, 1]
-            #   -> 3
+            #   -> [..., 0, 0, 1, 1, 0] 逆序
+            #   -> [..., 0, 0, 1, 2, 2] 累加求和
+            #   -> [..., 0, 0, 1, 1, 1] 取符号
+            #   -> 3 拥堵事件计数
+
+
+            ### 为什么要累加？？？
             mask_events = np.sign(np.cumsum(mask_events, axis=1))
             mask_events = np.sum(mask_events, axis=1, keepdims=True)
 
@@ -137,10 +150,14 @@ class Reader(object):
         self.test_data['t'] = test_event.astype(np.float)
 
         logging.info("compute marks for congestion events")
-        clustering = SpectralClustering(n_clusters=k)
+        # 频谱聚类算法（包）对邻接矩阵进行聚类
+        clustering = SpectralClustering(n_clusters=k)  
         clustering.fit(self.adj)
-        mark_indices = clustering.labels_ + 1
-        mark_lookup = np.zeros((207, k + 1), dtype=np.float)
+
+        mark_indices = clustering.labels_ + 1 # 类别标签
+
+        # 建立查找表，用于查找类别标签，207行，k+1列，标1的位置为类别标签
+        mark_lookup = np.zeros((207, k + 1), dtype=np.float) 
         mark_lookup[np.arange(207), mark_indices] = 1.
         return mark_lookup
 
@@ -152,6 +169,8 @@ class Reader(object):
                 'x_offsets': npzfiles['x_offsets'].astype(np.int),
                 'y_offsets': npzfiles['y_offsets'].astype(np.int)}
 
+
+    # 从pkl文件加载一个图，返回一个 DGLGraph 对象和邻接矩阵。
     @staticmethod
     def load_graph(fname):
         with open(fname, 'rb') as f:

@@ -56,6 +56,7 @@ class EasyDGLConfig(object):
 
 
 class AIAConv(nn.Module):
+    # 输入特征向量维度，输出特征向量维度，头数，标记数，注意力dropout比率
     def __init__(self, in_feats, out_feats,
                  num_heads, num_marks, att_drop=0.):
         super(AIAConv, self).__init__()
@@ -70,15 +71,15 @@ class AIAConv(nn.Module):
         self.fc_t = nn.Linear(in_feats, out_feats, bias=False)
         self.att_drop = nn.Dropout(att_drop)
 
-        # Event transformation
+        # Event transformation 事件转换
         head_feats = out_feats // num_heads
-        self.fc_i = nn.Linear(head_feats + 1, head_feats * self.num_marks)
+        self.fc_i = nn.Linear(head_feats + 1, head_feats * self.num_marks) # head_feats + 1是因为要加上时间（Wx+b的简便形式）
         self.weight_i = nn.Parameter(th.empty((num_marks, head_feats)))
         self.scale_i = nn.Parameter(th.empty(num_marks))
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        stddev = 0.02
+        stddev = 0.02 # 初始化正态分布标准差
         nn.init.normal_(self.fc_q.weight, 0., stddev)
         nn.init.normal_(self.fc_k.weight, 0., stddev)
         nn.init.normal_(self.fc_v.weight, 0., stddev)
@@ -87,31 +88,39 @@ class AIAConv(nn.Module):
         nn.init.kaiming_uniform_(self.weight_i, a=math.sqrt(5))
         nn.init.zeros_(self.scale_i)
 
+    # 事件编码，时间跨度（t-t^-）
     def intensities(self, events, timespans):
+        # 含有大量复制、分块、展平等操作
         batch_size = events.shape[0] // self.num_heads
 
         # Compute intermediate representations
         timespans = th.tile(timespans.unsqueeze(-1), [self.num_heads, 1, 1])
         mark_units = th.cat([events, timespans], dim=2)
-        mark_units = self.fc_i(mark_units)
-        mark_units = th.sigmoid(mark_units)  # ( h*N, T_q, C/h*E)
+        mark_units = self.fc_i(mark_units) # 全连接层就是W_k^G
+        mark_units = th.sigmoid(mark_units)  # ( h*N, T_q, C/h*E) 强度函数中计算得到的g_kl
         mark_units = th.cat(mark_units.chunk(self.num_marks, dim=2), dim=0)  # ( E*h*N, T_q, C/h)
 
-        # Perform mark-wise projection and intensity
+        # Perform mark-wise projection and intensity 强度函数自变量中的可学习参数W_k
         weight = self.weight_i.tile([1, self.num_heads]).unsqueeze(0).tile([batch_size, 1, 1])  # ( N, E, C )
         weight = th.cat(weight.chunk(self.num_heads, dim=2), dim=0)  # ( h*N, E, C/h )
         weight = th.cat(weight.chunk(self.num_marks, dim=1), dim=0)  # ( E*h*N, 1, C/h )
         weight = weight.permute(0, 2, 1)
 
+
+        # softplus中的可学习参数o_k
         scale = th.exp(self.scale_i)
         scale = scale.unsqueeze(0).tile([batch_size, 1])  # ( N, E )
         scale = scale.tile([self.num_heads, 1])  # ( h*N, E )
         scale = th.cat(scale.chunk(self.num_marks, dim=1), dim=0)  # ( E*h*N, 1)
 
+
+
+        # softplus强度计算部分
         all_mark_inty = th.matmul(mark_units, weight).squeeze(2) / scale  # ( h*N*E, T_q)
         all_mark_inty = scale * th.log(1. + th.exp(all_mark_inty))
         all_mark_inty = th.stack(all_mark_inty.chunk(self.num_marks, dim=0), dim=2)  # ( h*N, T_q, E)
         return all_mark_inty
+
 
     def forward(self, queries, keys, timespans, attention_masks, event_marks):
         # Linear transform
@@ -120,49 +129,54 @@ class AIAConv(nn.Module):
         V = self.fc_v(keys)  # (N, T_k, C)
         T = self.fc_t(keys)  # (N, T_k, C)
 
-        # Split and concat
+        # Split and concat 
         Q_ = th.cat(th.chunk(Q, self.num_heads, dim=2), dim=0)
         K_ = th.cat(th.chunk(K, self.num_heads, dim=2), dim=0)
         V_ = th.cat(th.chunk(V, self.num_heads, dim=2), dim=0)
         T_ = th.cat(th.chunk(T, self.num_heads, dim=2), dim=0)
 
-        # Multiplication
+        # 常规attention机制
         outs = th.matmul(Q_, K_.permute(0, 2, 1))  # (h*N, T_q, T_k)
+        outs = outs / math.sqrt(self.num_units) # 缩放
 
-        # Scale
-        outs = outs / math.sqrt(self.num_units)
-
-        # Key Masking
+        # Key Masking 掩码
         paddings = th.ones_like(outs) * (-2 ** 32 + 1)
-        outs = th.where(attention_masks == 0., paddings, outs)  # (h*N, T_q, T_k)
+        outs = th.where(attention_masks == 0., paddings, outs)  # (h*N, T_q, T_k) 符合要求的替换为padding中的内容
 
-        # Activation
+        # Activation 经过激活函数得到注意力权重
         outs = th.softmax(outs, dim=2)  # (h*N, T_q, T_k)
 
         # Weighted sum and dropout for events
+        # 第一个attention机制完成，输出一个编码
         E_ = th.matmul(outs, T_)  # ( h*N, T_q, C/h)
 
-        # TPPs intensity
+        # --------------------------------------------------------
+        # TPPs intensity 强度函数计算
         all_mark_inty = self.intensities(E_, timespans)
 
         # Use intensity as the weight of each key
         mark_inty = th.unsqueeze(all_mark_inty, 2)  # (h*N, T_q, 1, E)
         # Hereby the intensitiesfor MASK tokens are zero-out.
-        mark_inty = th.sum(mark_inty * event_marks, dim=-1)  # (h*N, T_q, T_k)
+        mark_inty = th.sum(mark_inty * event_marks, dim=-1)  # (h*N, T_q, T_k) 
+
         # Be very carefully, below intensities for MASK tokens are set to ones.
         # mark_inty_ones = th.eye(mark_inty.shape[1]).to(mark_inty.device)
         # mark_inty = mark_inty * (1 - mark_inty_ones) + mark_inty_ones
 
+
+        # --------------------------------------------------------
+        # 第二个attention机制
         # Weighted sum and dropout
         outs = outs * mark_inty  # (h*N, T_q, T_k)
         outs = th.matmul(self.att_drop(outs), V_)
 
         # Residual connection
         outs = th.cat(outs.chunk(self.num_heads, dim=0), dim=2)  # (N, T_q, C)
-        outs += queries[..., :self.num_units]
+        outs += queries[..., :self.num_units] # 输出特征向量维度
         return outs, all_mark_inty
 
 
+# 仅在推荐系统中使用
 class CTSMATransformer(nn.Module):
 
     def __init__(self, in_feats, out_feats,
@@ -171,7 +185,7 @@ class CTSMATransformer(nn.Module):
         super(CTSMATransformer, self).__init__()
         self.num_units = out_feats
         self.conv = AIAConv(in_feats, out_feats,
-                            num_heads, num_marks, att_drop)
+                            num_heads, num_marks, att_drop) # 实际上不是卷积，但是作者将其看做了卷积，可能认为其起到了卷积的作用
         self.fc_before = nn.Linear(out_feats, out_feats)
         self.drop_before = nn.Dropout(msg_drop)
         self.ln_before = nn.LayerNorm(out_feats)
