@@ -3,6 +3,12 @@
 @author: Chao Chen
 @contact: chao.chen@sjtu.edu.cn
 """
+
+# 1. sageconv的实际使用是在forward前段，aia结构之前，无mask使用
+# 2. 对于s1的输出，经过mask处理，交给AIA编码后，还需经过一个线性层
+#  3. AIA中的第一个A也有mask处理
+
+
 import logging
 import math
 import pickle
@@ -550,9 +556,9 @@ class NodeRegressor(nn.Module):
         self.mark_lookup = th.from_numpy(config.mark_lookup).float()
         self.tcoding = TimeSinusoidCoding(config.num_units)
 
-        num_units = config.num_units
-        num_features = config.num_features
-        self.fc_x = nn.Linear(num_features * self.num_timesteps_in, num_units, bias=False)
+        num_units = config.num_units # 神经元数？全联接层嵌入层的输出维度
+        num_features = config.num_features # 输入维度？
+        self.fc_x = nn.Linear(num_features * self.num_timesteps_in, num_units, bias=False) #sageconv中先进行Wx
         self.embedding = nn.Parameter(th.empty(self.num_nodes, num_units))
 
         # CaM
@@ -569,8 +575,8 @@ class NodeRegressor(nn.Module):
         self.saturation = 3.
         self.rff = nn.Parameter(th.empty(self.num_nodes, num_units))
 
-        self.k = 3
-        self.num_blocks = config.num_blocks
+        self.k = 3 # 图卷积层数-sageconv
+        self.num_blocks = config.num_blocks # 图卷积层数-剩余aiaconv/liner
         # Linear
         self.fc_h = nn.ModuleList()
         for _ in range(self.k, self.num_blocks):
@@ -614,17 +620,19 @@ class NodeRegressor(nn.Module):
         nn.init.zeros_(self.bias_o)
         nn.init.kaiming_uniform_(self.rff, a=math.sqrt(5))
 
+
+    # 对输入张量进行mask
     def mask(self, tensor, feat: dict):
         if not self.training or self.mask_rate == 0.:
             return tensor
 
         # mask_buskets: num_nodes, num_timesteps_out * batch_size, 1
         mask_buskets = feat['p'].int().squeeze(2)
-        mask_embedding = self.mask_embedding(mask_buskets)
+        mask_embedding = self.mask_embedding(mask_buskets) # 掩码嵌入
 
-        mask_sign = feat['p'].sign()
+        mask_sign = feat['p'].sign() # 通过符号标明掩码位置（正负号）
         # print(tensor.shape, mask_sign.shape, mask_embedding.shape)
-        tensor = tensor * (1. - mask_sign) + mask_embedding * mask_sign
+        tensor = tensor * (1. - mask_sign) + mask_embedding * mask_sign # 掩码替代，要么原版，要么掩码
         return tensor
 
     def forward(self, graph, feat):
@@ -635,23 +643,25 @@ class NodeRegressor(nn.Module):
         nfeat = nfeat.squeeze(1).permute(1, 0, 2)
 
         # mark_lookup: num_nodes, 1, num_marks
-        mark_lookup = self.mark_lookup.unsqueeze(1).to(nfeat.device)
+        mark_lookup = self.mark_lookup.unsqueeze(1).to(nfeat.device) # 分类
 
-        # tfeat: batch_size, num_timesteps_out, num_nodes
+        # tfeat: batch_size, num_timesteps_out, num_nodes 时间特征？
         tfeat: th.Tensor = feat['t'] / self.time_scalor
         # tfeat: num_nodes, num_timesteps_out * batch_size, 1
         tfeat = th.cat(tfeat.chunk(self.num_timesteps_out, dim=1), dim=0)
         tfeat = tfeat.permute(2, 0, 1)
 
         # ag: num_nodes, num_nodes
+        # 邻接矩阵？
         rrf = self.rff
         ag = th.matmul(rrf, rrf.permute(1, 0))
         ag = th.tanh(ag * self.saturation)
         ag = th.relu(ag) + th.eye(self.num_nodes).to(nfeat.device)
 
         # ==== SAGEConv ====
+        # 简单的卷积，引入了mask，引入了邻接矩阵，但是没有引入时间信息
         # layer_previous: num_nodes, batch_size, num_units
-        layer_previous = th.relu(self.fc_x(nfeat)) + self.embedding.unsqueeze(1)
+        layer_previous = th.relu(self.fc_x(nfeat)) + self.embedding.unsqueeze(1) # Wx + embeding
         msg_prop = [layer_previous]
         for i in range(self.k):
             layer_previous = self.layers[i](graph, ag, layer_previous)
@@ -663,50 +673,60 @@ class NodeRegressor(nn.Module):
         # tcodings: 1, 13, num_units
         timestamps = th.arange(1 + self.num_timesteps_out).unsqueeze(0)
         tcodings = self.tcoding(timestamps.to(nfeat.device))
+
+
         # x_src: num_nodes, num_timesteps_out * batch_size, num_units
         # tcodings_src: num_units
         tcodings_src = tcodings[0, 0]
         x_src = layer_previous + tcodings_src
-        x_src = x_src.tile(1, self.num_timesteps_out, 1)
+        x_src = x_src.tile(1, self.num_timesteps_out, 1) # 空间编码+时间编码
+
         # tcodings_dst: batch_size, num_timesteps_out, num_units
         tcodings_dst = tcodings[:, 1:].tile(nfeat.shape[1], 1, 1)
         # => num_timesteps_out * batch_size, 1, num_units
         tcodings_dst = th.cat(tcodings_dst.chunk(self.num_timesteps_out, dim=1), dim=0)
         # => 1, num_timesteps_out * batch_size, num_units
         tcodings_dst = tcodings_dst.permute(1, 0, 2)
+
         # x_dst: num_nodes, num_timesteps_out * batch_size, num_units
         x_dst = layer_previous.tile(1, self.num_timesteps_out, 1)
-        x_dst = self.mask(x_dst, feat) + tcodings_dst
+        x_dst = self.mask(x_dst, feat) + tcodings_dst # 原本的空间信息 with mask + 时间编码
+
         for i in range(self.k, self.num_blocks):
             layer, linear = self.layers[i], self.fc_h[i - self.k]
             # feat_src, x: num_nodes, num_timesteps_out * batch_size, num_units
-            feat_src = {'x': x_src}
+            feat_src = {'x': x_src} # 信息源
             # feat_src, x: num_nodes, num_timesteps_out * batch_size, num_units
             #           t: num_nodes, num_timesteps_out * batch_size, num_units
             #           m: num_nodes, 1, num_marks
             feat_dst = {'x': x_dst,
                         't': tfeat,
-                        'm': mark_lookup}
-            layer_input = (feat_src, feat_dst)
-            layer_geo = layer(graph, layer_input)
-            layer_adj = linear(x_dst)
+                        'm': mark_lookup} # 信息目标
+            layer_input = (feat_src, feat_dst) # 元组化
+
+            # ----------------
+            layer_geo = layer(graph, layer_input) # AIAConv
+            layer_adj = linear(x_dst) # Linear
+            # ----------------
+
             layer_adj = th.matmul(layer_adj.permute(1, 2, 0), ag).permute(2, 0, 1)
             layer_previous = layer_geo + layer_adj
             layer_previous = self.msg_drop(self.msg_act(layer_previous))
             x_src, x_dst = layer_previous, layer_previous
 
         # ==== DNN Estimator ====
+        # 最后一层的特殊处理
         # layer_previous: num_nodes, num_timesteps_out * batch_size, num_units
         # => num_nodes, batch_size, num_timesteps_out, num_units
-        qfeat = th.stack(layer_previous.chunk(self.num_timesteps_out, dim=1), dim=2)
+        qfeat = th.stack(layer_previous.chunk(self.num_timesteps_out, dim=1), dim=2) # qfeat经过AIA卷积的nfeat
         # => num_nodes * batch_size, num_timesteps_out, num_units
         qfeat = th.cat(qfeat.chunk(self.num_nodes, dim=0), dim=1)
         qfeat = qfeat.squeeze(0)
-        qfeat = self.qfeat_glu(qfeat)
+        qfeat = self.qfeat_glu(qfeat) # 门控？
 
         # nfeat: num_nodes, batch_size, num_timesteps_in * num_features
         # sfeat: num_nodes, batch_size, num_units
-        combined = th.cat([nfeat, sfeat], dim=2)
+        combined = th.cat([nfeat, sfeat], dim=2) #nfeat：接近原始的feat，sfeat：经过SAGE图卷积的nfeat
         # => 1, num_nodes * batch_size, num_timesteps_in * num_features + num_units
         combined = th.cat(combined.chunk(self.num_nodes, dim=0), dim=1)
         # => num_nodes * batch_size, 1, num_timesteps_out * num_units
@@ -714,7 +734,7 @@ class NodeRegressor(nn.Module):
         combined = self.fc_combined(combined)
         # => num_nodes * batch_size, num_timesteps_out, num_units
         combined = th.cat(combined.chunk(self.num_timesteps_out, dim=2), dim=1)
-        combined = self.combined_glu(combined)
+        combined = self.combined_glu(combined) # 门控？
 
         # num_nodes * batch_size, num_timesteps_out, 2 * num_units
         layer_outs = th.cat([qfeat, combined], dim=2)
@@ -730,7 +750,7 @@ class NodeRegressor(nn.Module):
     @staticmethod
     def loss(y_pred, y_true):
         mask = (y_true != 0).float()
-        mask /= mask.mean()
+        mask /= mask.mean() # 损失函数的mask，不是训练的mask
         loss = th.abs(y_pred - y_true)
         loss = loss * mask
         # trick for nans: https://discuss.pytorch.org/t/how-to-set-nan-in-tensor-to-0/3918/3

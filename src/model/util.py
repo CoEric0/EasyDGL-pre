@@ -84,6 +84,7 @@ class PositionCoding(nn.Module):
         return pcoding
 
 
+# 时间编码
 class TimeSinusoidCoding(nn.Module):
     def __init__(self, num_units):
         super(TimeSinusoidCoding, self).__init__()
