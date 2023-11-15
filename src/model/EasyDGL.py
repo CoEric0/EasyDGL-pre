@@ -498,7 +498,7 @@ class DGLAIAConv(nn.Module):
                 outs += h_dst
             return outs
 
-
+# 没用到之前的代码
 class EncodingLayer(nn.Module):
     def __init__(self, config: EasyDGLConfig):
         super(EncodingLayer, self).__init__()
@@ -510,8 +510,13 @@ class EncodingLayer(nn.Module):
 
         self.fc_orin = nn.Linear(num_units, num_units)
         self.fc_adju = nn.Linear(num_units, num_units)
-        self.gconv = dglnn.SAGEConv(num_units, num_units, 'mean')
-        self.instnorm = nn.InstanceNorm1d(num_nodes)
+        self.gconv = dglnn.SAGEConv(num_units, num_units, 'mean') # 基于空域的改进图卷积
+        # GraphSAGE的算法核心是将整张图的采样优化到当前邻居节点的采样
+        #1.对邻居进行随机采样，每一跳抽样的邻居数不多于 个，如图1.2第一跳采集了3个邻居，第二跳采集了5个邻居；
+        #2.生成目标节点的embedding：先聚合二跳邻居的特征，生成一跳邻居的embedding，再聚合一跳的embedding，生成目标节点的embedding；
+        #3.将目标节点的embedding输入全连接网络得到目标节点的预测值。
+
+        self.instnorm = nn.InstanceNorm1d(num_nodes) # 归一化
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
