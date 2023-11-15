@@ -6,7 +6,7 @@
 
 # 1. sageconv的实际使用是在forward前段，aia结构之前，无mask使用
 # 2. 对于s1的输出，经过mask处理，交给AIA编码后，还需经过一个线性层
-#  3. AIA中的第一个A也有mask处理
+# 3. AIA中的第一个A也有mask处理
 
 
 import logging
@@ -621,14 +621,14 @@ class NodeRegressor(nn.Module):
         nn.init.kaiming_uniform_(self.rff, a=math.sqrt(5))
 
 
-    # 对输入张量进行mask
+    # 对输入张量进行mask（CaM）
     def mask(self, tensor, feat: dict):
         if not self.training or self.mask_rate == 0.:
             return tensor
 
         # mask_buskets: num_nodes, num_timesteps_out * batch_size, 1
         mask_buskets = feat['p'].int().squeeze(2)
-        mask_embedding = self.mask_embedding(mask_buskets) # 掩码嵌入
+        mask_embedding = self.mask_embedding(mask_buskets) # mask掩码嵌入
 
         mask_sign = feat['p'].sign() # 通过符号标明掩码位置（正负号）
         # print(tensor.shape, mask_sign.shape, mask_embedding.shape)
@@ -716,9 +716,10 @@ class NodeRegressor(nn.Module):
 
         # ==== DNN Estimator ====
         # 最后一层的特殊处理
+        # 全连接层进行预测
         # layer_previous: num_nodes, num_timesteps_out * batch_size, num_units
         # => num_nodes, batch_size, num_timesteps_out, num_units
-        qfeat = th.stack(layer_previous.chunk(self.num_timesteps_out, dim=1), dim=2) # qfeat经过AIA卷积的nfeat
+        qfeat = th.stack(layer_previous.chunk(self.num_timesteps_out, dim=1), dim=2) # qfeat：经过AIA卷积的nfeat
         # => num_nodes * batch_size, num_timesteps_out, num_units
         qfeat = th.cat(qfeat.chunk(self.num_nodes, dim=0), dim=1)
         qfeat = qfeat.squeeze(0)
