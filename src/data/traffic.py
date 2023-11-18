@@ -174,7 +174,7 @@ class Reader(object):
     @staticmethod
     def load_graph(fname):
         with open(fname, 'rb') as f:
-            _, _, adj = pickle.load(f)
+            _, _, adj = pickle.load(f,encoding='latin1')
             adj = adj.astype(np.float)
             num_nodes = adj.shape[0]
 
